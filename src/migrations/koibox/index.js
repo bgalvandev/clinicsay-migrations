@@ -3,6 +3,7 @@ const productosRouter = require('./productos');
 const pacientesRouter = require('./pacientes');
 const citasRouter = require('./citas');
 const recibosRouter = require('./recibos');
+const encuestasRouter = require('./encuestas');
 
 const router = express.Router();
 
@@ -11,6 +12,7 @@ router.use('/', productosRouter);
 router.use('/', pacientesRouter);
 router.use('/', citasRouter);
 router.use('/', recibosRouter);
+router.use('/', encuestasRouter);
 
 // Aquí se pueden agregar más rutas de migración para Koibox
 // router.use('/', categoriasRouter);
