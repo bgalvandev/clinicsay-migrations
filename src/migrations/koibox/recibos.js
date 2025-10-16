@@ -287,7 +287,8 @@ router.post(
               let fechaRecibo = null;
               if (sale.fecha) {
                 const fecha = sale.fecha.split("T")[0];
-                const hora = sale.fecha.split("T")[1]?.split(".")[0] || "00:00:00";
+                const hora =
+                  sale.fecha.split("T")[1]?.split(".")[0] || "00:00:00";
                 fechaRecibo = `${fecha} ${hora}`;
               }
 
@@ -304,8 +305,7 @@ router.post(
                 id_factura: null,
                 old_id: sale.id,
                 id_presupuesto: null,
-                fecha_creacion:
-                  sale.created?.replace("T", " ").split(".")[0] || null,
+                fecha_creacion: fechaRecibo || null,
                 detalles_migracion: null,
                 descontar_del_presupuesto: 0,
                 // Metadata para procesar detalles después
@@ -318,9 +318,7 @@ router.post(
           console.log(`✓ Transformed ${transformedRecibos.length} recibos`);
 
           if (transformedRecibos.length === 0) {
-            console.log(
-              `⚠ Skipping batch ${currentPage + 1}: no valid sales`
-            );
+            console.log(`⚠ Skipping batch ${currentPage + 1}: no valid sales`);
             return;
           }
 
@@ -535,7 +533,10 @@ router.post(
       console.log("Inserted Detalles:", insertStats.insertedDetalles);
       console.log("Updated Citas:", insertStats.updatedCitas);
       console.log("Warnings:");
-      console.log("  - Missing Patients:", insertStats.warnings.missingPatients);
+      console.log(
+        "  - Missing Patients:",
+        insertStats.warnings.missingPatients
+      );
       console.log("  - Missing Doctors:", insertStats.warnings.missingDoctors);
       console.log("  - Missing Taxes:", insertStats.warnings.missingTaxes);
       console.log("  - Failed Details:", insertStats.warnings.failedDetails);
