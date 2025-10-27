@@ -65,13 +65,172 @@ router.post(
       );
 
       // ==========================================
+      // PASO 1.1: Preparar función para obtener y registrar pacientes faltantes
+      // ==========================================
+      console.log(
+        "\n→ Step 1.1: Preparing patient fetch and registration function..."
+      );
+
+      // Función para obtener paciente de Koibox y registrarlo
+      const fetchAndRegisterPatient = async (clienteId) => {
+        try {
+          console.log(`→ Fetching patient ${clienteId} from Koibox API...`);
+
+          const patientResponse = await get(
+            koiboxClient,
+            `/clientes/clientes/${clienteId}/`
+          );
+
+          if (!patientResponse.success) {
+            console.error(
+              `✗ Failed to fetch patient ${clienteId} from Koibox API`
+            );
+            return null;
+          }
+
+          const patient = patientResponse.data;
+
+          // Obtener filtros para mapear sexo y provincia
+          const filtersResponse = await get(
+            koiboxClient,
+            "/clientes/clientes/filters/"
+          );
+
+          let idSexo = null;
+          let ciudad = patient.localidad;
+          let referido = null;
+
+          if (filtersResponse.success) {
+            const filters = filtersResponse.data;
+
+            // Mapear sexo
+            if (patient.sexo && filters.sexos) {
+              const dbGenders = await query("SELECT * FROM sexo");
+              const genderMapping = await mapData(
+                "gender",
+                filters.sexos,
+                dbGenders
+              );
+              if (!genderMapping.error) {
+                idSexo = genderMapping.mapper[patient.sexo.toString()] || null;
+              }
+            }
+
+            // Mapear provincia para ciudad
+            if (patient.provincia && filters.provincias) {
+              const provinceMap = filters.provincias.reduce((acc, province) => {
+                acc[province.id.toString()] = province.text;
+                return acc;
+              }, {});
+              ciudad = provinceMap[patient.provincia.toString()] || patient.localidad;
+            }
+
+            // Mapear referido
+            if (patient.como_nos_conocio && filters.como_nos_conocio) {
+              const referralMap = filters.como_nos_conocio.reduce((acc, ref) => {
+                acc[ref.value.toString()] = ref.text;
+                return acc;
+              }, {});
+              referido = referralMap[patient.como_nos_conocio.toString()] || null;
+            }
+          }
+
+          // Determinar estado de registro
+          let idEstadoRegistro = 1; // Activo por defecto
+          if (!patient.is_active) {
+            idEstadoRegistro = 2; // Inactivo
+          }
+
+          // Concatenar apellidos
+          const apellido = [patient.apellido1, patient.apellido2]
+            .filter(Boolean)
+            .join(" ");
+
+          // Formatear teléfono con prefijo
+          const telefono = patient.movil
+            ? `+${patient.prefijo_tel || "34"}${patient.movil}`
+            : patient.fijo || "";
+
+          // Concatenar observaciones
+          const observaciones = [patient.notas, patient.informacion_clinica]
+            .filter(Boolean)
+            .join("\n");
+
+          // Preparar datos del paciente
+          const patientData = {
+            nombre: patient.nombre || "",
+            apellido: apellido || "",
+            email: patient.email || null,
+            telefono: telefono || null,
+            fecha_nacimiento: patient.fecha_nacimiento || null,
+            id_sexo: idSexo || null,
+            direccion: patient.direccion || null,
+            ciudad: ciudad || null,
+            id_clinica: clinic.id_clinica,
+            codigo_postal: patient.codigo_postal || "0",
+            nif_cif: patient.dni || "0",
+            url_foto: patient.foto_url_absolute_path || null,
+            referido: referido || null,
+            observaciones: observaciones || null,
+            profesion: null,
+            id_super_clinica: clinic.id_super_clinica,
+            id_estado_registro: idEstadoRegistro,
+            id_cliente: null,
+            id_medico: null,
+            lopd_aceptado: patient.is_agree_rgpd ? 1 : 0,
+            Importado: null,
+            kommo_lead_id: null,
+            old_id: patient.id,
+            fecha_alta: patient.fecha_alta
+              ? patient.fecha_alta.split("T")[0]
+              : null,
+            fecha_creacion:
+              patient.created?.replace("T", " ").split(".")[0] || null,
+            fecha_modificacion:
+              patient.updated?.replace("T", " ").split(".")[0] || null,
+          };
+
+          // Insertar paciente en la BD
+          const insertResult = await processBatches(
+            "pacientes",
+            [patientData],
+            1
+          );
+
+          if (insertResult.insertedRecords > 0) {
+            // Obtener el ID del paciente recién insertado
+            const insertedPatient = await query(
+              "SELECT id_paciente FROM pacientes WHERE old_id = ? AND id_clinica = ? AND id_super_clinica = ?",
+              [patient.id, clinic.id_clinica, clinic.id_super_clinica]
+            );
+
+            if (insertedPatient.length > 0) {
+              console.log(
+                `✓ Patient ${clienteId} registered successfully with ID ${insertedPatient[0].id_paciente}`
+              );
+              return insertedPatient[0].id_paciente;
+            }
+          }
+
+          console.error(`✗ Failed to insert patient ${clienteId}`);
+          return null;
+        } catch (error) {
+          console.error(
+            `✗ Error fetching/registering patient ${clienteId}:`,
+            error.message
+          );
+          return null;
+        }
+      };
+
+      // ==========================================
       // PASO 2: Obtener y mapear médicos con IA
       // ==========================================
       console.log("\n→ Step 2: Fetching and mapping doctors...");
 
       const allDoctorsResponse = await getAllPaginated(
         koiboxClient,
-        "/main/users/",
+        `/main/users/?centro=${clinic.centro}`,
         100
       );
 
@@ -202,6 +361,7 @@ router.post(
           missingDoctors: 0,
           missingTaxes: 0,
           failedDetails: 0,
+          registeredPatients: 0,
         },
       };
 
@@ -256,64 +416,77 @@ router.post(
           // ==========================================
           // PASO 4.2: Transformar recibos
           // ==========================================
-          const transformedRecibos = salesWithDetails
-            .map((sale) => {
-              // Mapear id_paciente desde old_id
-              const idPaciente = sale.cliente?.value
-                ? patientMapping[sale.cliente.value.toString()]
-                : null;
+          const transformedRecibos = [];
 
-              if (!idPaciente) {
+          for (const sale of salesWithDetails) {
+            // Mapear id_paciente desde old_id
+            let idPaciente = sale.cliente?.value
+              ? patientMapping[sale.cliente.value.toString()]
+              : null;
+
+            // Si no se encuentra el paciente, intentar obtenerlo de la API
+            if (sale.cliente?.value && !idPaciente) {
+              console.warn(
+                `⚠ Warning: Patient not found for sale ${sale.id} (patient ID: ${sale.cliente.value}), attempting to fetch from API...`
+              );
+
+              idPaciente = await fetchAndRegisterPatient(sale.cliente.value);
+
+              if (idPaciente) {
+                // Actualizar el mapping para futuras referencias
+                patientMapping[sale.cliente.value.toString()] = idPaciente;
+                globalStats.warnings.registeredPatients++;
+              } else {
                 globalStats.warnings.missingPatients++;
                 console.warn(
-                  `⚠ Warning: Patient not found for sale ${sale.id} (patient ID: ${sale.cliente?.value})`
+                  `✗ Could not fetch/register patient ${sale.cliente.value} for sale ${sale.id}, skipping...`
                 );
-                return null; // Skip this sale
+                continue; // Skip this sale
               }
+            }
 
-              // Mapear id_medico desde mapper
-              const idMedico = sale.assigned_to?.value
-                ? doctorMapping.mapper[sale.assigned_to.value.toString()]
-                : null;
+            // Mapear id_medico desde mapper
+            const idMedico = sale.assigned_to?.value
+              ? doctorMapping.mapper[sale.assigned_to.value.toString()]
+              : null;
 
-              if (sale.assigned_to?.value && !idMedico) {
-                globalStats.warnings.missingDoctors++;
-                console.warn(
-                  `⚠ Warning: Doctor not found for sale ${sale.id} (doctor ID: ${sale.assigned_to.value})`
-                );
-              }
+            if (sale.assigned_to?.value && !idMedico) {
+              globalStats.warnings.missingDoctors++;
+              console.warn(
+                `⚠ Warning: Doctor not found for sale ${sale.id} (doctor ID: ${sale.assigned_to.value})`
+              );
+            }
 
-              // Combinar fecha + hora para fecha_recibo
-              let fechaRecibo = null;
-              if (sale.fecha) {
-                const fecha = sale.fecha.split("T")[0];
-                const hora =
-                  sale.fecha.split("T")[1]?.split(".")[0] || "00:00:00";
-                fechaRecibo = `${fecha} ${hora}`;
-              }
+            // Combinar fecha + hora para fecha_recibo
+            let fechaRecibo = null;
+            if (sale.fecha) {
+              const fecha = sale.fecha.split("T")[0];
+              const hora =
+                sale.fecha.split("T")[1]?.split(".")[0] || "00:00:00";
+              fechaRecibo = `${fecha} ${hora}`;
+            }
 
-              return {
-                id_cita: null, // Se establecerá si existe cita
-                id_super_clinica: clinic.id_super_clinica,
-                id_clinica: clinic.id_clinica,
-                id_paciente: idPaciente,
-                id_medico: idMedico || null,
-                numero_recibo: sale.num_ticket || 0,
-                forma_pago: sale.forma_pago?.text || "efectivo",
-                fecha_recibo: fechaRecibo || null,
-                monto_total: sale.total || 0,
-                id_factura: null,
-                old_id: sale.id,
-                id_presupuesto: null,
-                fecha_creacion: fechaRecibo || null,
-                detalles_migracion: null,
-                descontar_del_presupuesto: 0,
-                // Metadata para procesar detalles después
-                _lineas_venta: sale.lineas_venta,
-                _cita_old_id: sale.cita,
-              };
-            })
-            .filter(Boolean); // Filtrar nulls
+            transformedRecibos.push({
+              id_cita: null, // Se establecerá si existe cita
+              id_super_clinica: clinic.id_super_clinica,
+              id_clinica: clinic.id_clinica,
+              id_paciente: idPaciente,
+              id_medico: idMedico || null,
+              numero_recibo: sale.num_ticket || 0,
+              forma_pago: sale.forma_pago?.text || "efectivo",
+              fecha_recibo: fechaRecibo || null,
+              monto_total: sale.total || 0,
+              id_factura: null,
+              old_id: sale.id,
+              id_presupuesto: null,
+              fecha_creacion: fechaRecibo || null,
+              detalles_migracion: null,
+              descontar_del_presupuesto: 0,
+              // Metadata para procesar detalles después
+              _lineas_venta: sale.lineas_venta,
+              _cita_old_id: sale.cita,
+            });
+          }
 
           console.log(`✓ Transformed ${transformedRecibos.length} recibos`);
 
@@ -536,6 +709,10 @@ router.post(
       console.log(
         "  - Missing Patients:",
         insertStats.warnings.missingPatients
+      );
+      console.log(
+        "  - Registered Patients from API:",
+        insertStats.warnings.registeredPatients
       );
       console.log("  - Missing Doctors:", insertStats.warnings.missingDoctors);
       console.log("  - Missing Taxes:", insertStats.warnings.missingTaxes);

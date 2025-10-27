@@ -193,8 +193,26 @@ router.post(
             } patients)...`
           );
 
+          // Filtrar pacientes por centro
+          const filteredPatients = patients.filter((patient) => {
+            return patient.centro === clinic.centro;
+          });
+
+          console.log(
+            `✓ Filtered ${filteredPatients.length}/${patients.length} patients for centro ${clinic.centro}`
+          );
+
+          if (filteredPatients.length === 0) {
+            console.log(
+              `⚠ No patients found for centro ${clinic.centro} in batch ${
+                currentPage + 1
+              }`
+            );
+            return;
+          }
+
           // Transformar pacientes de esta página
-          const transformedBatch = patients.map((patient) => {
+          const transformedBatch = filteredPatients.map((patient) => {
             // Determinar id_estado_registro basado en is_active y defaults
             let idEstadoRegistro = 1; // Por defecto: activo
 

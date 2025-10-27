@@ -126,7 +126,7 @@ router.post(
 
       const allDoctorsResponse = await getAllPaginated(
         koiboxClient,
-        "/main/users/",
+        `/main/users/?centro=${clinic.centro}`,
         100
       );
 
@@ -200,8 +200,14 @@ router.post(
         });
       }
 
-      const apiTreatments = allTreatmentsResponse.data;
-      console.log(`✓ Found ${apiTreatments.length} treatments in Koibox API`);
+      // Filtrar tratamientos por centro
+      const apiTreatments = allTreatmentsResponse.data.filter((treatment) => {
+        return treatment.centros && treatment.centros.includes(clinic.centro);
+      });
+
+      console.log(
+        `✓ Filtered ${apiTreatments.length}/${allTreatmentsResponse.data.length} treatments for centro ${clinic.centro}`
+      );
 
       // Obtener tratamientos de la BD local
       const dbTreatments = await query(
@@ -220,8 +226,9 @@ router.post(
         {
           relatedMappings: {
             taxMapper: taxMapping.mapper,
-            description: "Use taxMapper to map 'impuesto' field to 'id_tipo_iva' in missing objects"
-          }
+            description:
+              "Use taxMapper to map 'impuesto' field to 'id_tipo_iva' in missing objects",
+          },
         }
       );
 
@@ -380,10 +387,174 @@ router.post(
       );
 
       // ==========================================
-      // PASO 8: Procesar citas con streaming
+      // PASO 8: Preparar función para obtener y registrar pacientes faltantes
       // ==========================================
       console.log(
-        "\n→ Step 8: Fetching, transforming and inserting appointments..."
+        "\n→ Step 8: Preparing patient fetch and registration function..."
+      );
+
+      // Función para obtener paciente de Koibox y registrarlo
+      const fetchAndRegisterPatient = async (clienteId) => {
+        try {
+          console.log(`→ Fetching patient ${clienteId} from Koibox API...`);
+
+          const patientResponse = await get(
+            koiboxClient,
+            `/clientes/clientes/${clienteId}/`
+          );
+
+          if (!patientResponse.success) {
+            console.error(
+              `✗ Failed to fetch patient ${clienteId} from Koibox API`
+            );
+            return null;
+          }
+
+          const patient = patientResponse.data;
+
+          // Obtener filtros para mapear sexo y provincia
+          const filtersResponse = await get(
+            koiboxClient,
+            "/clientes/clientes/filters/"
+          );
+
+          let idSexo = null;
+          let ciudad = patient.localidad;
+          let referido = null;
+
+          if (filtersResponse.success) {
+            const filters = filtersResponse.data;
+
+            // Mapear sexo
+            if (patient.sexo && filters.sexos) {
+              const dbGenders = await query("SELECT * FROM sexo");
+              const genderMapping = await mapData(
+                "gender",
+                filters.sexos,
+                dbGenders
+              );
+              if (!genderMapping.error) {
+                idSexo = genderMapping.mapper[patient.sexo.toString()] || null;
+              }
+            }
+
+            // Mapear provincia para ciudad
+            if (patient.provincia && filters.provincias) {
+              const provinceMap = filters.provincias.reduce((acc, province) => {
+                acc[province.id.toString()] = province.text;
+                return acc;
+              }, {});
+              ciudad =
+                provinceMap[patient.provincia.toString()] || patient.localidad;
+            }
+
+            // Mapear referido
+            if (patient.como_nos_conocio && filters.como_nos_conocio) {
+              const referralMap = filters.como_nos_conocio.reduce(
+                (acc, ref) => {
+                  acc[ref.value.toString()] = ref.text;
+                  return acc;
+                },
+                {}
+              );
+              referido =
+                referralMap[patient.como_nos_conocio.toString()] || null;
+            }
+          }
+
+          // Determinar estado de registro
+          let idEstadoRegistro = 1; // Activo por defecto
+          if (!patient.is_active) {
+            idEstadoRegistro = 2; // Inactivo
+          }
+
+          // Concatenar apellidos
+          const apellido = [patient.apellido1, patient.apellido2]
+            .filter(Boolean)
+            .join(" ");
+
+          // Formatear teléfono con prefijo
+          const telefono = patient.movil
+            ? `+${patient.prefijo_tel || "34"}${patient.movil}`
+            : patient.fijo || "";
+
+          // Concatenar observaciones
+          const observaciones = [patient.notas, patient.informacion_clinica]
+            .filter(Boolean)
+            .join("\n");
+
+          // Preparar datos del paciente
+          const patientData = {
+            nombre: patient.nombre || "",
+            apellido: apellido || "",
+            email: patient.email || null,
+            telefono: telefono || null,
+            fecha_nacimiento: patient.fecha_nacimiento || null,
+            id_sexo: idSexo || null,
+            direccion: patient.direccion || null,
+            ciudad: ciudad || null,
+            id_clinica: clinic.id_clinica,
+            codigo_postal: patient.codigo_postal || "0",
+            nif_cif: patient.dni || "0",
+            url_foto: patient.foto_url_absolute_path || null,
+            referido: referido || null,
+            observaciones: observaciones || null,
+            profesion: null,
+            id_super_clinica: clinic.id_super_clinica,
+            id_estado_registro: idEstadoRegistro,
+            id_cliente: null,
+            id_medico: null,
+            lopd_aceptado: patient.is_agree_rgpd ? 1 : 0,
+            Importado: null,
+            kommo_lead_id: null,
+            old_id: patient.id,
+            fecha_alta: patient.fecha_alta
+              ? patient.fecha_alta.split("T")[0]
+              : null,
+            fecha_creacion:
+              patient.created?.replace("T", " ").split(".")[0] || null,
+            fecha_modificacion:
+              patient.updated?.replace("T", " ").split(".")[0] || null,
+          };
+
+          // Insertar paciente en la BD
+          const insertResult = await processBatches(
+            "pacientes",
+            [patientData],
+            1
+          );
+
+          if (insertResult.insertedRecords > 0) {
+            // Obtener el ID del paciente recién insertado
+            const insertedPatient = await query(
+              "SELECT id_paciente FROM pacientes WHERE old_id = ? AND id_clinica = ? AND id_super_clinica = ?",
+              [patient.id, clinic.id_clinica, clinic.id_super_clinica]
+            );
+
+            if (insertedPatient.length > 0) {
+              console.log(
+                `✓ Patient ${clienteId} registered successfully with ID ${insertedPatient[0].id_paciente}`
+              );
+              return insertedPatient[0].id_paciente;
+            }
+          }
+
+          console.error(`✗ Failed to insert patient ${clienteId}`);
+          return null;
+        } catch (error) {
+          console.error(
+            `✗ Error fetching/registering patient ${clienteId}:`,
+            error.message
+          );
+          return null;
+        }
+      };
+
+      // ==========================================
+      // PASO 9: Procesar citas con streaming
+      // ==========================================
+      console.log(
+        "\n→ Step 9: Fetching, transforming and inserting appointments..."
       );
 
       // Estadísticas globales
@@ -399,6 +570,7 @@ router.post(
           missingDoctors: 0,
           missingTreatments: 0,
           missingSpaces: 0,
+          registeredPatients: 0,
         },
       };
 
@@ -413,134 +585,164 @@ router.post(
             } appointments)...`
           );
 
-          // Transformar citas de esta página
-          const transformedBatch = appointments
-            .flatMap((appointment) => {
-              // Mapear id_paciente desde old_id
-              const idPaciente = appointment.cliente
-                ? patientMapping[appointment.cliente.toString()]
-                : null;
+          // Filtrar citas por centro
+          const filteredAppointments = appointments.filter((appointment) => {
+            return appointment.centro === clinic.centro;
+          });
 
-              if (appointment.cliente && !idPaciente) {
+          console.log(
+            `✓ Filtered ${filteredAppointments.length}/${appointments.length} appointments for centro ${clinic.centro}`
+          );
+
+          if (filteredAppointments.length === 0) {
+            console.log(
+              `⚠ No appointments found for centro ${clinic.centro} in batch ${
+                currentPage + 1
+              }`
+            );
+            return;
+          }
+
+          // Transformar citas de esta página
+          const transformedBatch = [];
+
+          for (const appointment of filteredAppointments) {
+            // Mapear id_paciente desde old_id
+            let idPaciente = appointment.cliente
+              ? patientMapping[appointment.cliente.toString()]
+              : null;
+
+            // Si no se encuentra el paciente, intentar obtenerlo de la API
+            if (appointment.cliente && !idPaciente) {
+              console.warn(
+                `⚠ Warning: Patient not found for appointment ${appointment.id} (patient ID: ${appointment.cliente}), attempting to fetch from API...`
+              );
+
+              idPaciente = await fetchAndRegisterPatient(appointment.cliente);
+
+              if (idPaciente) {
+                // Actualizar el mapping para futuras referencias
+                patientMapping[appointment.cliente.toString()] = idPaciente;
+                globalStats.warnings.registeredPatients++;
+              } else {
+                idPaciente = null;
                 globalStats.warnings.missingPatients++;
                 console.warn(
-                  `⚠ Warning: Patient not found for appointment ${appointment.id} (patient ID: ${appointment.cliente})`
+                  `✗ Could not fetch/register patient ${appointment.cliente} for appointment ${appointment.id}, registering with null patient...`
                 );
-                return null; // Skip this appointment
+                //continue; // Skip this appointment
               }
+            }
 
-              // Mapear id_medico desde mapper
-              const idMedico = appointment.user
-                ? doctorMapping.mapper[appointment.user.toString()]
+            // Mapear id_medico desde mapper
+            const idMedico = appointment.user
+              ? doctorMapping.mapper[appointment.user.toString()]
+              : null;
+
+            if (appointment.user && !idMedico) {
+              globalStats.warnings.missingDoctors++;
+              console.warn(
+                `⚠ Warning: Doctor not found for appointment ${appointment.id} (doctor ID: ${appointment.user})`
+              );
+            }
+
+            // Mapear id_estado_cita desde mapper
+            const idEstadoCita = appointment.estado
+              ? stateMapping.mapper[appointment.estado.toString()]
+              : null;
+
+            // Mapear id_espacio desde mapper (usar primer recurso si hay varios)
+            const firstResource =
+              appointment.recursos && appointment.recursos.length > 0
+                ? appointment.recursos[0]
+                : null;
+            const idEspacio = firstResource
+              ? spaceMapping.mapper[firstResource.toString()]
+              : null;
+
+            if (firstResource && !idEspacio) {
+              globalStats.warnings.missingSpaces++;
+            }
+
+            // Concatenar observaciones
+            const observacionesMedicas =
+              appointment.informacion_clinica || null;
+            const comentariosCita = [
+              appointment.observaciones,
+              appointment.notas,
+            ]
+              .filter(Boolean)
+              .join("\n");
+
+            // Datos base compartidos por todas las citas duplicadas
+            const baseAppointmentData = {
+              id_paciente: idPaciente,
+              id_medico: idMedico || null,
+              id_super_clinica: clinic.id_super_clinica,
+              id_clinica: clinic.id_clinica,
+              fecha_cita: appointment.fecha || null,
+              hora_inicio: appointment.hora_inicio || null,
+              hora_fin: appointment.hora_fin || null,
+              id_estado_cita: idEstadoCita || 1,
+              id_espacio: idEspacio || null,
+              comentario_ia: null,
+              comentario_ausente_cancelado: null,
+              es_pack_bono: null,
+              id_pack_bono: null,
+              id_presupuesto: null,
+              id_recibo: null,
+              item_presupuesto: null,
+              old_id: appointment.id,
+              id_contacto: null,
+              fecha_creacion:
+                appointment.created?.replace("T", " ").split(".")[0] || null,
+              fecha_modificacion:
+                appointment.updated?.replace("T", " ").split(".")[0] || null,
+              usuario_creacion: null,
+              id_usuario_creacion: null,
+              fecha_migracion: null,
+              detalles_migracion: null,
+              id_estados_cita_in: null,
+            };
+
+            // Obtener todos los servicios de la cita
+            const services =
+              appointment.servicios && appointment.servicios.length > 0
+                ? appointment.servicios
+                : [null];
+
+            // Crear una cita por cada servicio
+            const appointmentRecords = services.map((serviceId, index) => {
+              const isPrimary = index === 0;
+
+              // Mapear tratamiento
+              const idTratamiento = serviceId
+                ? treatmentMapping.mapper[serviceId.toString()]
                 : null;
 
-              if (appointment.user && !idMedico) {
-                globalStats.warnings.missingDoctors++;
+              if (serviceId && !idTratamiento) {
+                globalStats.warnings.missingTreatments++;
                 console.warn(
-                  `⚠ Warning: Doctor not found for appointment ${appointment.id} (doctor ID: ${appointment.user})`
+                  `⚠ Warning: Treatment not found for appointment ${appointment.id} (service ID: ${serviceId})`
                 );
               }
 
-              // Mapear id_estado_cita desde mapper
-              const idEstadoCita = appointment.estado
-                ? stateMapping.mapper[appointment.estado.toString()]
-                : null;
-
-              // Mapear id_espacio desde mapper (usar primer recurso si hay varios)
-              const firstResource =
-                appointment.recursos && appointment.recursos.length > 0
-                  ? appointment.recursos[0]
-                  : null;
-              const idEspacio = firstResource
-                ? spaceMapping.mapper[firstResource.toString()]
-                : null;
-
-              if (firstResource && !idEspacio) {
-                globalStats.warnings.missingSpaces++;
-              }
-
-              // Concatenar observaciones
-              const observacionesMedicas =
-                appointment.informacion_clinica || null;
-              const comentariosCita = [
-                appointment.observaciones,
-                appointment.notas,
-              ]
-                .filter(Boolean)
-                .join("\n");
-
-              // Datos base compartidos por todas las citas duplicadas
-              const baseAppointmentData = {
-                id_paciente: idPaciente,
-                id_medico: idMedico || null,
-                id_super_clinica: clinic.id_super_clinica,
-                id_clinica: clinic.id_clinica,
-                fecha_cita: appointment.fecha || null,
-                hora_inicio: appointment.hora_inicio || null,
-                hora_fin: appointment.hora_fin || null,
-                id_estado_cita: idEstadoCita || 1,
-                id_espacio: idEspacio || null,
-                comentario_ia: null,
-                comentario_ausente_cancelado: null,
-                es_pack_bono: null,
-                id_pack_bono: null,
-                id_presupuesto: null,
-                id_recibo: null,
-                item_presupuesto: null,
-                old_id: appointment.id,
-                id_contacto: null,
-                fecha_creacion:
-                  appointment.created?.replace("T", " ").split(".")[0] || null,
-                fecha_modificacion:
-                  appointment.updated?.replace("T", " ").split(".")[0] || null,
-                usuario_creacion: null,
-                id_usuario_creacion: null,
-                fecha_migracion: null,
-                detalles_migracion: null,
-                id_estados_cita_in: null,
+              return {
+                ...baseAppointmentData,
+                id_tratamiento: idTratamiento || null,
+                // Solo la primera cita tiene observaciones y comentarios
+                observaciones_medicas: isPrimary ? observacionesMedicas : null,
+                comentarios_cita: isPrimary ? comentariosCita || null : null,
+                // La primera es principal (NULL), las demás se marcarán después
+                id_cita_reference: isPrimary ? null : "PENDING",
+                // Metadata para identificar duplicados
+                _isPrimary: isPrimary,
+                _originalId: appointment.id,
               };
+            });
 
-              // Obtener todos los servicios de la cita
-              const services =
-                appointment.servicios && appointment.servicios.length > 0
-                  ? appointment.servicios
-                  : [null];
-
-              // Crear una cita por cada servicio
-              const appointmentRecords = services.map((serviceId, index) => {
-                const isPrimary = index === 0;
-
-                // Mapear tratamiento
-                const idTratamiento = serviceId
-                  ? treatmentMapping.mapper[serviceId.toString()]
-                  : null;
-
-                if (serviceId && !idTratamiento) {
-                  globalStats.warnings.missingTreatments++;
-                  console.warn(
-                    `⚠ Warning: Treatment not found for appointment ${appointment.id} (service ID: ${serviceId})`
-                  );
-                }
-
-                return {
-                  ...baseAppointmentData,
-                  id_tratamiento: idTratamiento || null,
-                  // Solo la primera cita tiene observaciones y comentarios
-                  observaciones_medicas: isPrimary
-                    ? observacionesMedicas
-                    : null,
-                  comentarios_cita: isPrimary ? comentariosCita || null : null,
-                  // La primera es principal (NULL), las demás se marcarán después
-                  id_cita_reference: isPrimary ? null : "PENDING",
-                  // Metadata para identificar duplicados
-                  _isPrimary: isPrimary,
-                  _originalId: appointment.id,
-                };
-              });
-
-              return appointmentRecords;
-            })
-            .filter(Boolean); // Filtrar nulls (citas sin paciente)
+            transformedBatch.push(...appointmentRecords);
+          }
 
           console.log(
             `✓ Transformed ${transformedBatch.length} appointment records (including duplicates for multiple services)`
@@ -562,7 +764,9 @@ router.post(
           );
 
           console.log(
-            `→ Inserting batch ${currentPage + 1}: ${primaryAppointments.length} primary, ${secondaryAppointments.length} secondary appointments`
+            `→ Inserting batch ${currentPage + 1}: ${
+              primaryAppointments.length
+            } primary, ${secondaryAppointments.length} secondary appointments`
           );
 
           // PASO 1: Insertar citas primarias
@@ -617,7 +821,12 @@ router.post(
 
             // Actualizar id_cita_reference en citas secundarias
             const cleanSecondaryAppointments = secondaryAppointments.map(
-              ({ _isPrimary, _originalId, id_cita_reference, ...appointment }) => ({
+              ({
+                _isPrimary,
+                _originalId,
+                id_cita_reference,
+                ...appointment
+              }) => ({
                 ...appointment,
                 id_cita_reference: primaryIdMapping[_originalId] || null,
               })
@@ -687,6 +896,10 @@ router.post(
       console.log(
         "  - Missing Patients:",
         insertStats.warnings.missingPatients
+      );
+      console.log(
+        "  - Registered Patients from API:",
+        insertStats.warnings.registeredPatients
       );
       console.log("  - Missing Doctors:", insertStats.warnings.missingDoctors);
       console.log(

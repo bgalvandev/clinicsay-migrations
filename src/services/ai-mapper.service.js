@@ -56,7 +56,7 @@ REGLAS IMPORTANTES:
 5. El formato debe ser exactamente: {"mapper": {...}, "missing": [...]}
 6. En "mapper": las claves son los IDs principales de la API (como string) y los valores son los IDs principales de la BD (como number)
 8. En "mapper": deben estar obligatoriamente TODOS los elementos de la API con su respectivo ID de la BD.
-9. En "missing": incluye elementos de la API que NO tienen correspondencia en la BD. IMPORTANTE: usa la ESTRUCTURA EXACTA de dbResult
+9. En "missing": incluye elementos de la API que NO tienen correspondencia en la BD. IMPORTANTE: usa la ESTRUCTURA EXACTA de dbResult con los valores exactamente iguales al los del API para los campos descriptivos.
 10. En "missing": solo si contiene los campos id_clinica y id_super_clinica que usen los mismos valores que se repiten en dbResult (ojo solo para estos dos campos, para los demás según criterio).
 11. Si hay error en el análisis, devuelve: {"error": "ERROR_CODE", "message": "descripción"}
 

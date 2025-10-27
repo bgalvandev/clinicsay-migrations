@@ -133,8 +133,22 @@ router.post(
             } products)...`
           );
 
+          // Filtrar productos por centro
+          const filteredProducts = products.filter((product) => {
+            return product.centros && product.centros.includes(clinic.centro);
+          });
+
+          console.log(
+            `✓ Filtered ${filteredProducts.length}/${products.length} products for centro ${clinic.centro}`
+          );
+
+          if (filteredProducts.length === 0) {
+            console.log(`⚠ No products found for centro ${clinic.centro} in batch ${currentPage + 1}`);
+            return;
+          }
+
           // Transformar productos de esta página
-          const transformedBatch = products.map((product) => {
+          const transformedBatch = filteredProducts.map((product) => {
             // Determinar id_estado_registro basado en is_active y defaults
             let idEstadoRegistro = 1; // Por defecto: activo
 
@@ -143,11 +157,17 @@ router.post(
             }
 
             // Mapear id de impuesto usando el mapper de IA
-            const idTipoIva = taxMapping.mapper[product.impuesto.toString()];
+            const idTipoIva = product.impuesto
+              ? taxMapping.mapper[product.impuesto.toString()]
+              : null;
 
-            if (!idTipoIva) {
+            if (!idTipoIva && product.impuesto) {
               console.warn(
                 `⚠ Warning: No tax mapping found for product ${product.id} (tax ID: ${product.impuesto})`
+              );
+            } else if (!product.impuesto) {
+              console.warn(
+                `⚠ Warning: Product ${product.id} has no tax ID (impuesto is null)`
               );
             }
 

@@ -65,7 +65,7 @@ router.post(
       // ==========================================
       console.log("\n→ Step 2: Fetching and mapping doctors...");
 
-      const allDoctorsResponse = await get(koiboxClient, "/main/users/");
+      const allDoctorsResponse = await get(koiboxClient, `/main/users/?centro=${clinic.centro}`);
 
       if (!allDoctorsResponse.success) {
         return res.status(500).json({
