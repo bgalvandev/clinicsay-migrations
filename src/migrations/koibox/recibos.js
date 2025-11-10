@@ -496,12 +496,45 @@ router.post(
           }
 
           // ==========================================
-          // PASO 4.3: Insertar recibos
+          // PASO 4.3: Validar recibos existentes
           // ==========================================
-          console.log(`→ Inserting ${transformedRecibos.length} recibos...`);
+          console.log(`→ Validating existing recibos...`);
+
+          const oldIdsToCheck = transformedRecibos.map((r) => r.old_id);
+          const placeholdersCheck = oldIdsToCheck.map(() => "?").join(",");
+
+          const existingRecibos = await query(
+            `SELECT old_id FROM recibos
+             WHERE old_id IN (${placeholdersCheck})
+             AND id_clinica = ?
+             AND id_super_clinica = ?`,
+            [...oldIdsToCheck, clinic.id_clinica, clinic.id_super_clinica]
+          );
+
+          const existingOldIds = new Set(existingRecibos.map((r) => r.old_id));
+          console.log(`✓ Found ${existingOldIds.size} recibos already existing in database`);
+
+          // Filtrar recibos que NO existen en la BD
+          const newRecibos = transformedRecibos.filter(
+            (recibo) => !existingOldIds.has(recibo.old_id)
+          );
+
+          console.log(
+            `→ ${newRecibos.length} new recibos to insert (${transformedRecibos.length - newRecibos.length} skipped as duplicates)`
+          );
+
+          if (newRecibos.length === 0) {
+            console.log(`⚠ Skipping batch ${currentPage + 1}: all recibos already exist`);
+            return;
+          }
+
+          // ==========================================
+          // PASO 4.4: Insertar recibos nuevos
+          // ==========================================
+          console.log(`→ Inserting ${newRecibos.length} new recibos...`);
 
           // Remover metadata antes de insertar
-          const cleanRecibos = transformedRecibos.map(
+          const cleanRecibos = newRecibos.map(
             ({ _lineas_venta, _cita_old_id, ...recibo }) => recibo
           );
 
@@ -524,17 +557,17 @@ router.post(
           );
 
           // ==========================================
-          // PASO 4.4: Obtener IDs de recibos recién insertados
+          // PASO 4.5: Obtener IDs de recibos (recién insertados + existentes)
           // ==========================================
-          const oldIds = transformedRecibos.map((r) => r.old_id);
-          const placeholders = oldIds.map(() => "?").join(",");
+          const allOldIds = transformedRecibos.map((r) => r.old_id);
+          const allPlaceholders = allOldIds.map(() => "?").join(",");
 
           const insertedRecibos = await query(
             `SELECT id_recibo, old_id FROM recibos
-             WHERE old_id IN (${placeholders})
+             WHERE old_id IN (${allPlaceholders})
              AND id_clinica = ?
              AND id_super_clinica = ?`,
-            [...oldIds, clinic.id_clinica, clinic.id_super_clinica]
+            [...allOldIds, clinic.id_clinica, clinic.id_super_clinica]
           );
 
           // Crear mapeo old_id -> id_recibo
@@ -543,10 +576,10 @@ router.post(
             reciboIdMapping[recibo.old_id] = recibo.id_recibo;
           });
 
-          console.log(`✓ Found ${insertedRecibos.length} inserted recibos`);
+          console.log(`✓ Found ${insertedRecibos.length} recibos (new + existing)`);
 
           // ==========================================
-          // PASO 4.5: Transformar e insertar detalles de recibos
+          // PASO 4.6: Transformar e insertar detalles de recibos
           // ==========================================
           console.log("→ Processing sale details (lineas_venta)...");
 
@@ -604,69 +637,98 @@ router.post(
           console.log(`✓ Transformed ${allDetalles.length} sale details`);
 
           if (allDetalles.length > 0) {
-            console.log(`→ Inserting ${allDetalles.length} detalle_recibo...`);
+            // Validar detalles existentes
+            console.log(`→ Validating existing detalle_recibo...`);
 
-            const detalleStats = await processBatches(
-              "detalle_recibo",
-              allDetalles,
-              100
+            const detalleOldIds = allDetalles.map((d) => d.old_id);
+            const detallePlaceholders = detalleOldIds.map(() => "?").join(",");
+
+            const existingDetalles = await query(
+              `SELECT old_id FROM detalle_recibo
+               WHERE old_id IN (${detallePlaceholders})`,
+              detalleOldIds
             );
 
-            globalStats.insertedDetalles += detalleStats.insertedRecords;
+            const existingDetalleOldIds = new Set(existingDetalles.map((d) => d.old_id));
+            console.log(`✓ Found ${existingDetalleOldIds.size} detalles already existing in database`);
 
-            if (detalleStats.failedBatches > 0) {
-              globalStats.warnings.failedDetails += detalleStats.failedBatches;
-            }
+            // Filtrar detalles que NO existen en la BD
+            const newDetalles = allDetalles.filter(
+              (detalle) => !existingDetalleOldIds.has(detalle.old_id)
+            );
 
             console.log(
-              `✓ Detalle_recibo inserted: ${detalleStats.insertedRecords}/${detalleStats.totalRecords}`
+              `→ ${newDetalles.length} new detalles to insert (${allDetalles.length - newDetalles.length} skipped as duplicates)`
             );
+
+            if (newDetalles.length > 0) {
+              console.log(`→ Inserting ${newDetalles.length} detalle_recibo...`);
+
+              const detalleStats = await processBatches(
+                "detalle_recibo",
+                newDetalles,
+                100
+              );
+
+              globalStats.insertedDetalles += detalleStats.insertedRecords;
+
+              if (detalleStats.failedBatches > 0) {
+                globalStats.warnings.failedDetails += detalleStats.failedBatches;
+              }
+
+              console.log(
+                `✓ Detalle_recibo inserted: ${detalleStats.insertedRecords}/${detalleStats.totalRecords}`
+              );
+            }
           }
 
           // ==========================================
-          // PASO 4.6: Actualizar citas con id_recibo
+          // PASO 4.7: Actualizar citas con id_recibo (BULK UPDATE)
           // ==========================================
           console.log("→ Updating citas with id_recibo...");
 
           const citasToUpdate = transformedRecibos.filter(
-            (recibo) => recibo._cita_old_id
+            (recibo) => recibo._cita_old_id && reciboIdMapping[recibo.old_id]
           );
 
           if (citasToUpdate.length > 0) {
-            for (const recibo of citasToUpdate) {
-              const idRecibo = reciboIdMapping[recibo.old_id];
+            try {
+              // Construir bulk update con CASE WHEN
+              const whenClauses = citasToUpdate
+                .map((recibo) => {
+                  const idRecibo = reciboIdMapping[recibo.old_id];
+                  return `WHEN old_id = ${recibo._cita_old_id} THEN ${idRecibo}`;
+                })
+                .join(" ");
 
-              if (!idRecibo) {
-                continue;
-              }
+              const citaOldIds = citasToUpdate.map((r) => r._cita_old_id);
+              const citaPlaceholders = citaOldIds.map(() => "?").join(",");
 
-              try {
-                const updateResult = await query(
-                  `UPDATE citas
-                   SET id_recibo = ?
-                   WHERE old_id = ?
-                   AND id_clinica = ?
-                   AND id_super_clinica = ?`,
-                  [
-                    idRecibo,
-                    recibo._cita_old_id,
-                    clinic.id_clinica,
-                    clinic.id_super_clinica,
-                  ]
-                );
+              const bulkUpdateQuery = `
+                UPDATE citas
+                SET id_recibo = CASE ${whenClauses} END
+                WHERE old_id IN (${citaPlaceholders})
+                AND id_clinica = ?
+                AND id_super_clinica = ?
+              `;
 
-                if (updateResult.affectedRows > 0) {
-                  globalStats.updatedCitas++;
-                }
-              } catch (error) {
-                console.warn(
-                  `⚠ Warning: Failed to update cita ${recibo._cita_old_id}:`,
-                  error.message
-                );
-              }
+              const updateResult = await query(bulkUpdateQuery, [
+                ...citaOldIds,
+                clinic.id_clinica,
+                clinic.id_super_clinica,
+              ]);
+
+              globalStats.updatedCitas += updateResult.affectedRows || 0;
+
+              console.log(
+                `✓ Updated ${updateResult.affectedRows || 0} citas (bulk update)`
+              );
+            } catch (error) {
+              console.warn(
+                `⚠ Warning: Failed to bulk update citas:`,
+                error.message
+              );
             }
-
-            console.log(`✓ Updated ${globalStats.updatedCitas} citas`);
           }
 
           console.log(

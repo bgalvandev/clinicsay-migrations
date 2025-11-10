@@ -174,7 +174,7 @@ router.post(
       console.log("✓ Tax mapping completed successfully");
 
       // ==========================================
-      // PASO 4: Procesar presupuestos por paciente
+      // PASO 4: Procesar presupuestos por paciente (EN PARALELO)
       // ==========================================
       console.log("\n→ Step 4: Processing budgets by patient...");
 
@@ -200,69 +200,81 @@ router.post(
         },
       };
 
-      // Procesar cada paciente
-      for (let i = 0; i < dbPatients.length; i++) {
-        const patient = dbPatients[i];
-        const oldId = patient.old_id;
+      // Procesar pacientes en lotes paralelos
+      const BATCH_SIZE = 10; // Procesar 10 pacientes en paralelo
 
-        if (!oldId) {
-          console.warn(
-            `⚠ Warning: Patient ${patient.id_paciente} has no old_id, skipping...`
-          );
-          continue;
-        }
+      for (let batchStart = 0; batchStart < dbPatients.length; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, dbPatients.length);
+        const patientBatch = dbPatients.slice(batchStart, batchEnd);
 
         console.log(
-          `\n→ Processing patient ${i + 1}/${
-            dbPatients.length
-          } (old_id: ${oldId})...`
+          `\n→ Processing patient batch ${Math.floor(batchStart / BATCH_SIZE) + 1}/${Math.ceil(dbPatients.length / BATCH_SIZE)} (patients ${batchStart + 1}-${batchEnd})...`
         );
 
-        try {
-          // ==========================================
-          // PASO 4.1: Obtener presupuestos del paciente (con paginación)
-          // ==========================================
-          let allBudgets = [];
-          let offset = 0;
-          const limit = 100;
-          let hasMore = true;
+        // Procesar este lote de pacientes en paralelo
+        await Promise.all(
+          patientBatch.map(async (patient, indexInBatch) => {
+            const i = batchStart + indexInBatch;
+            const oldId = patient.old_id;
 
-          while (hasMore) {
-            const budgetResponse = await get(
-              koiboxClient,
-              `/ventas/presupuestos/?cliente=${oldId}&offset=${offset}&limit=${limit}`
-            );
-
-            if (!budgetResponse.success) {
+            if (!oldId) {
               console.warn(
-                `⚠ Warning: Failed to fetch budgets for patient ${oldId}`
+                `⚠ Warning: Patient ${patient.id_paciente} has no old_id, skipping...`
               );
-              globalStats.warnings.missingPatients++;
-              break;
+              return; // Early return instead of continue
             }
-
-            const { count, results } = budgetResponse.data;
-
-            if (!results || results.length === 0) {
-              break;
-            }
-
-            allBudgets = allBudgets.concat(results);
-
-            // Verificar si hay más páginas
-            offset += limit;
-            hasMore = offset < count;
 
             console.log(
-              `  Fetched ${allBudgets.length}/${count} budgets for patient ${oldId}`
+              `\n→ Processing patient ${i + 1}/${
+                dbPatients.length
+              } (old_id: ${oldId})...`
             );
-          }
 
-          if (allBudgets.length === 0) {
-            console.log(`  No budgets found for patient ${oldId}`);
-            globalStats.processedPatients++;
-            continue;
-          }
+            try {
+              // ==========================================
+              // PASO 4.1: Obtener presupuestos del paciente (con paginación)
+              // ==========================================
+              let allBudgets = [];
+              let offset = 0;
+              const limit = 100;
+              let hasMore = true;
+
+              while (hasMore) {
+                const budgetResponse = await get(
+                  koiboxClient,
+                  `/ventas/presupuestos/?cliente=${oldId}&offset=${offset}&limit=${limit}`
+                );
+
+                if (!budgetResponse.success) {
+                  console.warn(
+                    `⚠ Warning: Failed to fetch budgets for patient ${oldId}`
+                  );
+                  globalStats.warnings.missingPatients++;
+                  break;
+                }
+
+                const { count, results } = budgetResponse.data;
+
+                if (!results || results.length === 0) {
+                  break;
+                }
+
+                allBudgets = allBudgets.concat(results);
+
+                // Verificar si hay más páginas
+                offset += limit;
+                hasMore = offset < count;
+
+                console.log(
+                  `  Fetched ${allBudgets.length}/${count} budgets for patient ${oldId}`
+                );
+              }
+
+              if (allBudgets.length === 0) {
+                console.log(`  No budgets found for patient ${oldId}`);
+                globalStats.processedPatients++;
+                return; // Early return instead of continue
+              }
 
           console.log(
             `✓ Found ${allBudgets.length} budgets for patient ${oldId}`
@@ -354,35 +366,64 @@ router.post(
 
             // Insertar presupuestos sin venta
             if (transformedPresupuestos.length > 0) {
-              const cleanPresupuestos = transformedPresupuestos.map(
-                ({ _lineas_presupuesto, ...presupuesto }) => presupuesto
+              console.log("→ Validating existing presupuestos...");
+
+              // Validar presupuestos existentes
+              const presupuestoOldIds = transformedPresupuestos.map((p) => p.old_id);
+              const presupuestoPlaceholders = presupuestoOldIds.map(() => "?").join(",");
+
+              const existingPresupuestos = await query(
+                `SELECT old_id FROM presupuestos
+                 WHERE old_id IN (${presupuestoPlaceholders})
+                 AND id_clinica = ?
+                 AND id_super_clinica = ?`,
+                [...presupuestoOldIds, clinic.id_clinica, clinic.id_super_clinica]
               );
 
-              const presupuestoStats = await processBatches(
-                "presupuestos",
-                cleanPresupuestos,
-                100
-              );
+              const existingPresupuestoOldIds = new Set(existingPresupuestos.map((p) => p.old_id));
+              console.log(`✓ Found ${existingPresupuestoOldIds.size} presupuestos already existing in database`);
 
-              globalStats.totalBudgets += presupuestoStats.totalRecords;
-              globalStats.insertedPresupuestos +=
-                presupuestoStats.insertedRecords;
-              globalStats.errors.push(...presupuestoStats.errors);
+              // Filtrar presupuestos que NO existen en la BD
+              const newPresupuestos = transformedPresupuestos.filter(
+                (presupuesto) => !existingPresupuestoOldIds.has(presupuesto.old_id)
+              );
 
               console.log(
-                `✓ Presupuestos inserted: ${presupuestoStats.insertedRecords}/${presupuestoStats.totalRecords}`
+                `→ ${newPresupuestos.length} new presupuestos to insert (${transformedPresupuestos.length - newPresupuestos.length} skipped as duplicates)`
               );
 
-              // Obtener IDs de presupuestos insertados
-              const oldIds = transformedPresupuestos.map((p) => p.old_id);
-              const placeholders = oldIds.map(() => "?").join(",");
+              if (newPresupuestos.length === 0) {
+                console.log("⚠ All presupuestos already exist, skipping insertion");
+              } else {
+                const cleanPresupuestos = newPresupuestos.map(
+                  ({ _lineas_presupuesto, ...presupuesto }) => presupuesto
+                );
+
+                const presupuestoStats = await processBatches(
+                  "presupuestos",
+                  cleanPresupuestos,
+                  100
+                );
+
+                globalStats.totalBudgets += presupuestoStats.totalRecords;
+                globalStats.insertedPresupuestos += presupuestoStats.insertedRecords;
+                globalStats.errors.push(...presupuestoStats.errors);
+
+                console.log(
+                  `✓ Presupuestos inserted: ${presupuestoStats.insertedRecords}/${presupuestoStats.totalRecords}`
+                );
+              }
+
+              // Obtener IDs de presupuestos (nuevos + existentes)
+              const allPresupuestoOldIds = transformedPresupuestos.map((p) => p.old_id);
+              const allPresupuestoPlaceholders = allPresupuestoOldIds.map(() => "?").join(",");
 
               const insertedPresupuestos = await query(
                 `SELECT id_presupuesto, old_id FROM presupuestos
-                 WHERE old_id IN (${placeholders})
+                 WHERE old_id IN (${allPresupuestoPlaceholders})
                  AND id_clinica = ?
                  AND id_super_clinica = ?`,
-                [...oldIds, clinic.id_clinica, clinic.id_super_clinica]
+                [...allPresupuestoOldIds, clinic.id_clinica, clinic.id_super_clinica]
               );
 
               const presupuestoIdMapping = {};
@@ -438,22 +479,48 @@ router.post(
               });
 
               if (allDetalles.length > 0) {
-                const detalleStats = await processBatches(
-                  "detalle_presupuesto",
-                  allDetalles,
-                  100
+                // Validar detalles existentes
+                console.log(`→ Validating existing detalle_presupuesto...`);
+
+                const detalleOldIds = allDetalles.map((d) => d.old_id);
+                const detallePlaceholders = detalleOldIds.map(() => "?").join(",");
+
+                const existingDetalles = await query(
+                  `SELECT old_id FROM detalle_presupuesto
+                   WHERE old_id IN (${detallePlaceholders})`,
+                  detalleOldIds
                 );
 
-                globalStats.insertedDetalles += detalleStats.insertedRecords;
+                const existingDetalleOldIds = new Set(existingDetalles.map((d) => d.old_id));
+                console.log(`✓ Found ${existingDetalleOldIds.size} detalles already existing in database`);
 
-                if (detalleStats.failedBatches > 0) {
-                  globalStats.warnings.failedDetails +=
-                    detalleStats.failedBatches;
-                }
+                // Filtrar detalles que NO existen en la BD
+                const newDetalles = allDetalles.filter(
+                  (detalle) => !existingDetalleOldIds.has(detalle.old_id)
+                );
 
                 console.log(
-                  `✓ Detalle_presupuesto inserted: ${detalleStats.insertedRecords}/${detalleStats.totalRecords}`
+                  `→ ${newDetalles.length} new detalles to insert (${allDetalles.length - newDetalles.length} skipped as duplicates)`
                 );
+
+                if (newDetalles.length > 0) {
+                  const detalleStats = await processBatches(
+                    "detalle_presupuesto",
+                    newDetalles,
+                    100
+                  );
+
+                  globalStats.insertedDetalles += detalleStats.insertedRecords;
+
+                  if (detalleStats.failedBatches > 0) {
+                    globalStats.warnings.failedDetails +=
+                      detalleStats.failedBatches;
+                  }
+
+                  console.log(
+                    `✓ Detalle_presupuesto inserted: ${detalleStats.insertedRecords}/${detalleStats.totalRecords}`
+                  );
+                }
               }
             }
           }
@@ -527,64 +594,11 @@ router.post(
                 );
 
                 // ==========================================
-                // PASO 4.4.1: Insertar presupuesto
+                // PASO 4.4.1: Validar e Insertar presupuesto
                 // ==========================================
-                const idPaciente = patientMapping[oldId];
+                console.log(`  → Checking if presupuesto ${budget.id} already exists...`);
 
-                if (!idPaciente) {
-                  globalStats.warnings.missingPatients++;
-                  continue;
-                }
-
-                const idMedico = budget.created_by?.value
-                  ? doctorMapping.mapper[budget.created_by.value.toString()]
-                  : null;
-
-                let fecha = null;
-                if (budget.fecha) {
-                  fecha = budget.fecha.replace("T", " ").split(".")[0];
-                }
-
-                const montoTotal = budget.total || 0;
-                const montoPagado = venta.total || 0;
-                const saldoPendiente = montoTotal - montoPagado;
-
-                const presupuestoData = {
-                  id_paciente: idPaciente,
-                  id_super_clinica: clinic.id_super_clinica,
-                  id_clinica: clinic.id_clinica,
-                  fecha: fecha,
-                  fecha_vencimiento: null,
-                  url_presupuesto: null,
-                  monto_total: montoTotal,
-                  monto_pagado: montoPagado,
-                  saldo_pendiente: saldoPendiente,
-                  id_estado: defaultValues.id_estado || 1,
-                  id_tipo_pago: budget.venta !== null ? 1 : null,
-                  id_medico: idMedico || null,
-                  descripcion: budget.observaciones || null,
-                  old_id: budget.id,
-                  id_estado_registro: defaultValues.id_estado_registro || 1,
-                  numero_historia: null,
-                  id_contacto: null,
-                  fecha_creacion: fecha,
-                  usuario_creacion: budget.created_by?.text || null,
-                  id_usuario_creacion: budget.created_by?.value || null,
-                  id_factura: null,
-                };
-
-                const presupuestoStats = await processBatches(
-                  "presupuestos",
-                  [presupuestoData],
-                  1
-                );
-
-                globalStats.totalBudgets++;
-                globalStats.insertedPresupuestos +=
-                  presupuestoStats.insertedRecords;
-
-                // Obtener ID del presupuesto insertado
-                const [insertedPresupuesto] = await query(
+                const [existingPresupuesto] = await query(
                   `SELECT id_presupuesto FROM presupuestos
                    WHERE old_id = ?
                    AND id_clinica = ?
@@ -592,14 +606,87 @@ router.post(
                   [budget.id, clinic.id_clinica, clinic.id_super_clinica]
                 );
 
-                if (!insertedPresupuesto) {
-                  console.warn(
-                    `⚠ Warning: Could not find inserted presupuesto for budget ${budget.id}`
-                  );
-                  continue;
-                }
+                let idPresupuesto;
 
-                const idPresupuesto = insertedPresupuesto.id_presupuesto;
+                if (existingPresupuesto) {
+                  console.log(
+                    `  ⊗ Presupuesto ${budget.id} already exists (id: ${existingPresupuesto.id_presupuesto}), skipping insertion`
+                  );
+                  idPresupuesto = existingPresupuesto.id_presupuesto;
+                } else {
+                  const idPaciente = patientMapping[oldId];
+
+                  if (!idPaciente) {
+                    globalStats.warnings.missingPatients++;
+                    continue;
+                  }
+
+                  const idMedico = budget.created_by?.value
+                    ? doctorMapping.mapper[budget.created_by.value.toString()]
+                    : null;
+
+                  let fecha = null;
+                  if (budget.fecha) {
+                    fecha = budget.fecha.replace("T", " ").split(".")[0];
+                  }
+
+                  const montoTotal = budget.total || 0;
+                  const montoPagado = venta.total || 0;
+                  const saldoPendiente = montoTotal - montoPagado;
+
+                  const presupuestoData = {
+                    id_paciente: idPaciente,
+                    id_super_clinica: clinic.id_super_clinica,
+                    id_clinica: clinic.id_clinica,
+                    fecha: fecha,
+                    fecha_vencimiento: null,
+                    url_presupuesto: null,
+                    monto_total: montoTotal,
+                    monto_pagado: montoPagado,
+                    saldo_pendiente: saldoPendiente,
+                    id_estado: defaultValues.id_estado || 1,
+                    id_tipo_pago: budget.venta !== null ? 1 : null,
+                    id_medico: idMedico || null,
+                    descripcion: budget.observaciones || null,
+                    old_id: budget.id,
+                    id_estado_registro: defaultValues.id_estado_registro || 1,
+                    numero_historia: null,
+                    id_contacto: null,
+                    fecha_creacion: fecha,
+                    usuario_creacion: budget.created_by?.text || null,
+                    id_usuario_creacion: budget.created_by?.value || null,
+                    id_factura: null,
+                  };
+
+                  const presupuestoStats = await processBatches(
+                    "presupuestos",
+                    [presupuestoData],
+                    1
+                  );
+
+                  globalStats.totalBudgets++;
+                  globalStats.insertedPresupuestos +=
+                    presupuestoStats.insertedRecords;
+
+                  // Obtener ID del presupuesto insertado
+                  const [insertedPresupuesto] = await query(
+                    `SELECT id_presupuesto FROM presupuestos
+                     WHERE old_id = ?
+                     AND id_clinica = ?
+                     AND id_super_clinica = ?`,
+                    [budget.id, clinic.id_clinica, clinic.id_super_clinica]
+                  );
+
+                  if (!insertedPresupuesto) {
+                    console.warn(
+                      `⚠ Warning: Could not find inserted presupuesto for budget ${budget.id}`
+                    );
+                    continue;
+                  }
+
+                  idPresupuesto = insertedPresupuesto.id_presupuesto;
+                  console.log(`  ✓ Presupuesto ${budget.id} inserted (id: ${idPresupuesto})`);
+                }
 
                 // Insertar detalles del presupuesto
                 const detallesPresupuesto = [];
@@ -633,14 +720,39 @@ router.post(
                 });
 
                 if (detallesPresupuesto.length > 0) {
-                  const detallePresupuestoStats = await processBatches(
-                    "detalle_presupuesto",
-                    detallesPresupuesto,
-                    100
+                  // Validar detalles existentes
+                  const detalleOldIds = detallesPresupuesto.map((d) => d.old_id);
+                  const detallePlaceholders = detalleOldIds.map(() => "?").join(",");
+
+                  const existingDetalles = await query(
+                    `SELECT old_id FROM detalle_presupuesto
+                     WHERE old_id IN (${detallePlaceholders})`,
+                    detalleOldIds
                   );
 
-                  globalStats.insertedDetalles +=
-                    detallePresupuestoStats.insertedRecords;
+                  const existingDetalleOldIds = new Set(existingDetalles.map((d) => d.old_id));
+
+                  // Filtrar detalles que NO existen
+                  const newDetallesPresupuesto = detallesPresupuesto.filter(
+                    (detalle) => !existingDetalleOldIds.has(detalle.old_id)
+                  );
+
+                  if (newDetallesPresupuesto.length > 0) {
+                    const detallePresupuestoStats = await processBatches(
+                      "detalle_presupuesto",
+                      newDetallesPresupuesto,
+                      100
+                    );
+
+                    globalStats.insertedDetalles +=
+                      detallePresupuestoStats.insertedRecords;
+
+                    console.log(
+                      `  ✓ Inserted ${detallePresupuestoStats.insertedRecords} detalle_presupuesto (${existingDetalleOldIds.size} skipped)`
+                    );
+                  } else {
+                    console.log("  ⊗ All detalle_presupuesto already exist, skipping");
+                  }
                 }
 
                 // ==========================================
@@ -737,14 +849,39 @@ router.post(
                 });
 
                 if (detallesRecibo.length > 0) {
-                  const detalleReciboStats = await processBatches(
-                    "detalle_recibo",
-                    detallesRecibo,
-                    100
+                  // Validar detalles de recibo existentes
+                  const detalleReciboOldIds = detallesRecibo.map((d) => d.old_id);
+                  const detalleReciboPlaceholders = detalleReciboOldIds.map(() => "?").join(",");
+
+                  const existingDetallesRecibo = await query(
+                    `SELECT old_id FROM detalle_recibo
+                     WHERE old_id IN (${detalleReciboPlaceholders})`,
+                    detalleReciboOldIds
                   );
 
-                  globalStats.insertedDetallesRecibo +=
-                    detalleReciboStats.insertedRecords;
+                  const existingDetalleReciboOldIds = new Set(existingDetallesRecibo.map((d) => d.old_id));
+
+                  // Filtrar detalles que NO existen
+                  const newDetallesRecibo = detallesRecibo.filter(
+                    (detalle) => !existingDetalleReciboOldIds.has(detalle.old_id)
+                  );
+
+                  if (newDetallesRecibo.length > 0) {
+                    const detalleReciboStats = await processBatches(
+                      "detalle_recibo",
+                      newDetallesRecibo,
+                      100
+                    );
+
+                    globalStats.insertedDetallesRecibo +=
+                      detalleReciboStats.insertedRecords;
+
+                    console.log(
+                      `  ✓ Inserted ${detalleReciboStats.insertedRecords} detalle_recibo (${existingDetalleReciboOldIds.size} skipped)`
+                    );
+                  } else {
+                    console.log("  ⊗ All detalle_recibo already exist, skipping");
+                  }
                 }
 
                 console.log(
@@ -773,6 +910,12 @@ router.post(
             error: error.message,
           });
         }
+          })
+        );
+
+        console.log(
+          `✓ Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} completed (${globalStats.processedPatients}/${dbPatients.length} patients processed)`
+        );
       }
 
       // ==========================================

@@ -349,7 +349,7 @@ router.post(
       console.log(`✓ Found ${completedSurveys.length} completed surveys`);
 
       // ==========================================
-      // PASO 5: Obtener detalles y migrar respuestas
+      // PASO 5: Obtener detalles y migrar respuestas (EN PARALELO)
       // ==========================================
       console.log("\n→ Step 5: Fetching details and migrating responses...");
 
@@ -361,83 +361,98 @@ router.post(
         errors: [],
       };
 
-      for (const survey of completedSurveys) {
-        stats.processed++;
+      // Procesar encuestas en lotes paralelos
+      const BATCH_SIZE = 15; // Procesar 15 encuestas en paralelo
 
-        try {
-          // Obtener detalle con respuestas
-          const detailResponse = await get(
-            koiboxClient,
-            `/marketing/encuestas-realizadas/${survey.id}`
-          );
+      for (let batchStart = 0; batchStart < completedSurveys.length; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, completedSurveys.length);
+        const surveyBatch = completedSurveys.slice(batchStart, batchEnd);
 
-          if (!detailResponse.success || !detailResponse.data) {
-            console.warn(`  ⚠ Could not fetch details for survey ${survey.id}, skipping...`);
-            stats.skipped++;
-            continue;
-          }
+        console.log(
+          `\n→ Processing survey batch ${Math.floor(batchStart / BATCH_SIZE) + 1}/${Math.ceil(completedSurveys.length / BATCH_SIZE)} (surveys ${batchStart + 1}-${batchEnd})...`
+        );
 
-          const surveyDetail = detailResponse.data;
+        // Procesar este lote de encuestas en paralelo
+        await Promise.all(
+          surveyBatch.map(async (survey) => {
+            try {
+              // Obtener detalle con respuestas
+              const detailResponse = await get(
+                koiboxClient,
+                `/marketing/encuestas-realizadas/${survey.id}`
+              );
 
-          // Verificar si tenemos la plantilla mapeada
-          const templateMap = templatesMapping[surveyDetail.encuesta.id];
-          if (!templateMap) {
-            console.warn(`  ⚠ Template ${surveyDetail.encuesta.id} not found in mapping, skipping...`);
-            stats.skipped++;
-            continue;
-          }
+              if (!detailResponse.success || !detailResponse.data) {
+                console.warn(`  ⚠ Could not fetch details for survey ${survey.id}, skipping...`);
+                stats.skipped++;
+                return; // Early return instead of continue
+              }
 
-          // Obtener id_paciente del mapeo
-          const id_paciente = patientMapping[surveyDetail.cliente.value];
-          if (!id_paciente) {
-            console.warn(`  ⚠ Patient ${surveyDetail.cliente.value} not found in mapping, skipping...`);
-            stats.skipped++;
-            continue;
-          }
+              const surveyDetail = detailResponse.data;
 
-          // Verificar si ya existe esta respuesta
-          const existingResponse = await query(
-            `SELECT id FROM anamnesis_hojas_has_pacientes
-             WHERE id_anamnesis_hoja = ? AND id_paciente = ?`,
-            [templateMap.id_anamnesis_hoja, id_paciente]
-          );
+              // Verificar si tenemos la plantilla mapeada
+              const templateMap = templatesMapping[surveyDetail.encuesta.id];
+              if (!templateMap) {
+                console.warn(`  ⚠ Template ${surveyDetail.encuesta.id} not found in mapping, skipping...`);
+                stats.skipped++;
+                return; // Early return instead of continue
+              }
 
-          if (existingResponse.length > 0) {
-            stats.skipped++;
-            continue;
-          }
+              // Obtener id_paciente del mapeo
+              const id_paciente = patientMapping[surveyDetail.cliente.value];
+              if (!id_paciente) {
+                console.warn(`  ⚠ Patient ${surveyDetail.cliente.value} not found in mapping, skipping...`);
+                stats.skipped++;
+                return; // Early return instead of continue
+              }
 
-          // Transformar respuestas al formato local usando el servicio
-          const respuestas = transformSurveyResponses(
-            surveyDetail.preguntas,
-            templateMap.preguntasMapping
-          );
+              // Verificar si ya existe esta respuesta
+              const existingResponse = await query(
+                `SELECT id FROM anamnesis_hojas_has_pacientes
+                 WHERE id_anamnesis_hoja = ? AND id_paciente = ?`,
+                [templateMap.id_anamnesis_hoja, id_paciente]
+              );
 
-          // Insertar respuestas
-          await query(
-            `INSERT INTO anamnesis_hojas_has_pacientes
-             (id_anamnesis_hoja, id_paciente, respuestas, estado, fecha_creacion)
-             VALUES (?, ?, ?, 1, ?)`,
-            [
-              templateMap.id_anamnesis_hoja,
-              id_paciente,
-              JSON.stringify(respuestas),
-              surveyDetail.created ? surveyDetail.created.replace("T", " ").split(".")[0] : null
-            ]
-          );
+              if (existingResponse.length > 0) {
+                stats.skipped++;
+                return; // Early return instead of continue
+              }
 
-          stats.inserted++;
+              // Transformar respuestas al formato local usando el servicio
+              const respuestas = transformSurveyResponses(
+                surveyDetail.preguntas,
+                templateMap.preguntasMapping
+              );
 
-          if (stats.processed % 10 === 0) {
-            console.log(`  → Processed ${stats.processed}/${stats.total} surveys...`);
-          }
-        } catch (error) {
-          console.error(`  ✗ Error processing survey ${survey.id}:`, error.message);
-          stats.errors.push({
-            survey_id: survey.id,
-            error: error.message,
-          });
-        }
+              // Insertar respuestas
+              await query(
+                `INSERT INTO anamnesis_hojas_has_pacientes
+                 (id_anamnesis_hoja, id_paciente, respuestas, estado, fecha_creacion)
+                 VALUES (?, ?, ?, 1, ?)`,
+                [
+                  templateMap.id_anamnesis_hoja,
+                  id_paciente,
+                  JSON.stringify(respuestas),
+                  surveyDetail.created ? surveyDetail.created.replace("T", " ").split(".")[0] : null
+                ]
+              );
+
+              stats.inserted++;
+              stats.processed++;
+            } catch (error) {
+              console.error(`  ✗ Error processing survey ${survey.id}:`, error.message);
+              stats.errors.push({
+                survey_id: survey.id,
+                error: error.message,
+              });
+              stats.processed++;
+            }
+          })
+        );
+
+        console.log(
+          `  ✓ Batch ${Math.floor(batchStart / BATCH_SIZE) + 1} completed (${stats.processed}/${stats.total} surveys processed)`
+        );
       }
 
       console.log("\n✓ Responses migration completed:");
